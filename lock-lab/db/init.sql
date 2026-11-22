@@ -14,6 +14,29 @@ VALUES ('A-01', 'WIDGET-X', 100),
 ON CONFLICT (location_id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
+-- 冲销记录：一轮实验里，每个调拨单最多冲销一次。
+-- UNIQUE(run_id, transfer_key) 是“重复/并发冲销只入账一次”的数据库防线：
+-- 同一单的第二个事务在 INSERT ... ON CONFLICT DO NOTHING 处等待并拿不到行，
+-- 随后读取第一条已提交的冲销结果原样返回。
+-- from_qty_after / to_qty_after 记录冲销提交后原调拨方向两个库位的余量。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reversals (
+    reversal_id    BIGSERIAL PRIMARY KEY,
+    run_id         TEXT        NOT NULL,
+    transfer_key   TEXT        NOT NULL,
+    transfer_id    TEXT        NOT NULL,
+    from_location  TEXT        NOT NULL,
+    to_location    TEXT        NOT NULL,
+    qty            INTEGER     NOT NULL CHECK (qty > 0),
+    from_qty_after INTEGER,
+    to_qty_after   INTEGER,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id, transfer_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reversals_run_id ON reversals (run_id);
+
+-- ---------------------------------------------------------------------------
 -- 实际等待关系观测视图：一条记录 = “blocked_app 正被 blocking_app 阻塞”
 --
 -- 关键点：PostgreSQL 15 中，行级锁(FOR UPDATE)的等待者在 pg_locks 里只留下

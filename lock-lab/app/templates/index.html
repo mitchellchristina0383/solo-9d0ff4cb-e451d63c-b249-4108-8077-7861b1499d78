@@ -60,6 +60,16 @@
   code.sql { color:var(--purple); }
   .pulse { animation:pulse 1.1s infinite; }
   @keyframes pulse { 50% { opacity:.4; } }
+  .rev-box { margin-top:14px; border-top:1px dashed var(--line); padding-top:14px; }
+  .rev-box h3 { margin:0 0 10px; font-size:14px; }
+  .rev-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .rev-row select { width:auto; min-width:260px; }
+  .rev-note { font-size:12px; }
+  .rev-note.ok { color:var(--green); }
+  .rev-note.err { color:var(--red); }
+  .rev-card { background:#0b1220; border:1px solid var(--green); border-radius:8px;
+              padding:10px 12px; margin-top:8px; font-size:13px; }
+  .rev-card .qty { font-weight:700; color:var(--green); }
 </style>
 </head>
 <body>
@@ -96,6 +106,16 @@
     <div id="verdict"></div>
     <div class="kv" id="runKV"></div>
     <div style="margin-top:16px;" class="workers" id="workers"></div>
+    <div class="rev-box" id="revBox">
+      <h3>冲销一笔已确认提交的调拨（按原数量反向调回）</h3>
+      <div class="rev-row">
+        <select id="revKey"></select>
+        <button id="revBtn" class="danger">冲销</button>
+        <span id="revMsg" class="muted rev-note"></span>
+      </div>
+      <div class="muted rev-note" id="revHint"></div>
+      <div id="revList"></div>
+    </div>
   </section>
 
   <section class="panel">
@@ -109,6 +129,7 @@
     <h2>④ 实验结束后的库存实况</h2>
     <table id="invTable"><thead><tr><th>库位</th><th>商品</th><th>现存数量</th><th>更新时间</th></tr></thead>
       <tbody><tr><td colspan="4" class="muted">实验结束后显示</td></tr></tbody></table>
+    <p class="muted" style="font-size:12px;margin:8px 0 0;">冲销提交后会刷新为冲销后的实际余量；原调拨结局不上改。</p>
   </section>
 
   <section class="panel">
@@ -118,7 +139,7 @@
 </main>
 
 <script>
-let pollTimer = null, currentRunId = null;
+let pollTimer = null, currentRunId = null, lastRun = null;
 
 const $ = id => document.getElementById(id);
 
@@ -186,6 +207,7 @@ function verdictHtml(r) {
 }
 
 function renderRun(r) {
+  lastRun = r;
   $('runMeta').textContent = `run=${r.run_id} · 次序=${r.lock_order === 'same' ? '相同' : '相反'} · 状态=${r.status}`;
   $('verdict').innerHTML = verdictHtml(r);
   $('runKV').innerHTML = [
@@ -248,7 +270,79 @@ function renderRun(r) {
     $('invTable').querySelector('tbody').innerHTML = r.inventory_after.map(i =>
       `<tr><td>${esc(i.location_id)}</td><td>${esc(i.product_code)}</td><td><b>${i.qty_on_hand}</b></td><td class="mono muted">${esc(i.updated_at)}</td></tr>`).join('');
   }
+
+  renderReversalPanel(r);
 }
+
+// 冲销面板：只列本轮“已确认提交且尚未冲销”的调拨单
+function renderReversalPanel(r) {
+  if (!r || !r.workers) return;
+  const reversals = r.reversals || {};
+  const workers = Object.values(r.workers).sort((a,b)=>a.key.localeCompare(b.key));
+  const available = workers.filter(w => w.phase === 'done' && w.result === 'committed' && !reversals[w.key]);
+  const closed = r.status === 'running' || !r.finished_at;
+  const oldRun = r.is_latest_accepted === false;
+
+  const sel = $('revKey');
+  const prev = sel.value;
+  sel.innerHTML = available.length
+    ? available.map(w => {
+        const t = r.transfers[w.key];
+        return `<option value="${esc(w.key)}">${esc(w.key)} · ${esc(t.id)}（${esc(t.from)} → ${esc(t.to)}，${t.qty} 件）</option>`;
+      }).join('')
+    : '<option value="">无可冲销的已提交调拨单</option>';
+  if (available.some(w => w.key === prev)) sel.value = prev;
+
+  let hint = '';
+  if (closed) hint = '本轮尚未结束，结束后才可冲销。';
+  else if (oldRun) hint = '只允许冲销最近受理的一轮；该轮之后已受理新一轮，旧轮不再接受新冲销（服务端会拒绝）。';
+  else if (!available.length) hint = '本轮没有可冲销的调拨单（未提交、或已冲销）。';
+  $('revHint').textContent = hint;
+
+  const blocked = closed || oldRun || !available.length;
+  $('revBtn').disabled = blocked;
+  $('revKey').disabled = blocked;
+
+  const rows = workers.filter(w => reversals[w.key]).map(w => {
+    const rv = reversals[w.key], t = r.transfers[w.key];
+    return `<div class="rev-card">
+      <b>${esc(w.key)} · ${esc(rv.transfer_id)}</b> 已冲销
+      <span class="qty">${esc(rv.qty)} 件</span>
+      <span class="muted">（${esc(rv.from_location)} 扣回 / ${esc(rv.to_location)} 加回）</span>
+      <div>冲销后余量：<b>${esc(rv.from_location)} = ${rv.from_qty_after}</b>，
+        <b>${esc(rv.to_location)} = ${rv.to_qty_after}</b>
+        <span class="muted mono">｜reversal_id=${esc(rv.reversal_id)}｜${esc(rv.created_at || '')}</span></div>
+      <div class="muted">原调拨结局保持为 <span class="tag ${esc(w.result)}">${esc(w.result)}</span>（${esc(w.message || '')}）</div>
+    </div>`;
+  }).join('');
+  $('revList').innerHTML = rows;
+}
+
+$('revBtn').onclick = async () => {
+  const key = $('revKey').value;
+  if (!key || !currentRunId) return;
+  const runId = currentRunId;
+  $('revBtn').disabled = true;
+  $('revMsg').className = 'muted rev-note';
+  $('revMsg').textContent = '冲销中…';
+  try {
+    const body = await api(`/api/runs/${runId}/reversals`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({transfer_key: key}),
+    });
+    const rv = body.reversal;
+    $('revMsg').className = 'rev-note ok';
+    $('revMsg').textContent = body.duplicate
+      ? `重复提交：未重复入账，返回原冲销结果（reversal_id=${rv.reversal_id}，${rv.from_location}=${rv.from_qty_after}，${rv.to_location}=${rv.to_qty_after}）`
+      : `冲销已提交：${rv.transfer_id} 反向 ${rv.qty} 件（reversal_id=${rv.reversal_id}）`;
+    // 用户可能在请求期间切到了别的轮次；只在仍看同一轮时刷新
+    if (currentRunId === runId) renderRun(await api(`/api/runs/${runId}`));
+  } catch (e) {
+    $('revMsg').className = 'rev-note err';
+    $('revMsg').textContent = '冲销被拒绝：' + e.message;
+    if (currentRunId === runId) renderReversalPanel(lastRun && lastRun.run_id === runId ? lastRun : {});
+  }
+};
 
 async function loadHistory() {
   const items = await api('/api/runs');

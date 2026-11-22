@@ -53,8 +53,68 @@ MAX_HISTORY = 50
 
 # 全局只允许一轮在跑（等待关系必须来自同一批连接才好复盘）
 _manager_lock = threading.Lock()
+# 冲销受理与新一轮受理共用同一把条件锁：
+#   * 先拿到锁的一方的“受理”生效；另一方随后看到的都是已更新的受理状态
+#   * 新一轮的 reset_inventory() 必须在所有已受理冲销事务结束后才执行
+_manager_cond = threading.Condition(_manager_lock)
 _active_run = None          # type: ignore[var-annotated]
 _runs: dict[str, "Run"] = {}
+# 最近一次被受理的轮次；旧轮不再接受“新的”冲销
+_latest_accepted_run_id: str | None = None
+# 已被受理、事务尚未结束的冲销数量（新一轮重置库存前必须等它归零）
+_reversals_inflight = 0
+
+# 与 db/init.sql 保持一致；应用启动时再执行一次，兼容已存在的 PG 数据卷
+# （官方 postgres 镜像只在空数据目录时执行 /docker-entrypoint-initdb.d）。
+REVERSALS_DDL = """
+CREATE TABLE IF NOT EXISTS reversals (
+    reversal_id    BIGSERIAL PRIMARY KEY,
+    run_id         TEXT        NOT NULL,
+    transfer_key   TEXT        NOT NULL,
+    transfer_id    TEXT        NOT NULL,
+    from_location  TEXT        NOT NULL,
+    to_location    TEXT        NOT NULL,
+    qty            INTEGER     NOT NULL CHECK (qty > 0),
+    from_qty_after INTEGER,
+    to_qty_after   INTEGER,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (run_id, transfer_key)
+);
+CREATE INDEX IF NOT EXISTS idx_reversals_run_id ON reversals (run_id);
+"""
+
+_schema_lock = threading.Lock()
+_schema_ready = False
+
+
+class ReversalError(Exception):
+    """冲销请求在业务上被拒绝（页面按 409 展示）。"""
+
+
+def ensure_reversals_schema():
+    """幂等建冲销表；旧数据卷也能在不删库的情况下升级。"""
+    global _schema_ready
+    if _schema_ready:
+        return
+    with _schema_lock:
+        if _schema_ready:
+            return
+        conn = connect("locklab-schema")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(REVERSALS_DDL)
+            conn.commit()
+            _schema_ready = True
+        finally:
+            conn.close()
+
+
+def wait_for_inflight_reversals():
+    """新一轮重置库存前，等所有已受理的冲销事务真正结束。"""
+    with _manager_cond:
+        while _reversals_inflight > 0:
+            log.info("inventory reset waits for %d in-flight reversal(s)", _reversals_inflight)
+            _manager_cond.wait()
 
 
 def now_iso():
@@ -92,6 +152,7 @@ class Run:
     wait_cycle: list[str] | None = None
     deadlock_victim: str | None = None
     db_declared_deadlock: bool = False
+    reversals: dict[str, dict] = field(default_factory=dict)
 
     def public(self):
         with self.lock:
@@ -112,6 +173,9 @@ class Run:
                 "wait_cycle": self.wait_cycle,
                 "deadlock_victim": self.deadlock_victim,
                 "db_declared_deadlock": self.db_declared_deadlock,
+                "reversals": self.reversals,
+                # 页面据此提示旧轮不能再接受新冲销（服务端仍会独立校验）
+                "is_latest_accepted": _latest_accepted_run_id == self.run_id,
                 "transfers": TRANSFERS,
             }
 
@@ -149,6 +213,7 @@ def worker(run: Run, key: str, barrier: threading.Barrier):
     state = {
         "key": key,
         "transfer_id": t["id"],
+        "qty": t["qty"],
         "app_name": app_name,
         "pid": None,
         "phase": "connecting",
@@ -349,6 +414,8 @@ def _terminate_run_connections(run: Run, admin_conn):
 # 一轮实验的编排
 # --------------------------------------------------------------------------- #
 def reset_inventory():
+    # 已受理的冲销还在事务里时不能重置，否则会把冲销的写入覆盖掉/交错
+    wait_for_inflight_reversals()
     conn = connect("locklab-reset")
     try:
         with conn.cursor() as cur:
@@ -382,6 +449,7 @@ def derive_wait_cycle(run: Run):
 def run_supervisor(run: Run):
     global _active_run
     try:
+        ensure_reversals_schema()
         reset_inventory()
         run.start_ts = time.time()
         barrier = threading.Barrier(3)
@@ -431,6 +499,158 @@ def run_supervisor(run: Run):
 
 
 # --------------------------------------------------------------------------- #
+# 冲销
+# --------------------------------------------------------------------------- #
+def _reversal_row_to_dict(row) -> dict:
+    return {
+        "reversal_id": row[0],
+        "run_id": row[1],
+        "transfer_key": row[2],
+        "transfer_id": row[3],
+        "from_location": row[4],
+        "to_location": row[5],
+        "qty": row[6],
+        "from_qty_after": row[7],
+        "to_qty_after": row[8],
+        "created_at": row[9].isoformat() if row[9] else None,
+    }
+
+
+REVERSAL_COLUMNS = (
+    "reversal_id, run_id, transfer_key, transfer_id, from_location, to_location, "
+    "qty, from_qty_after, to_qty_after, created_at"
+)
+
+
+def fetch_existing_reversal(run_id: str, key: str) -> dict | None:
+    """只读查询已落账的冲销；用于重提时直接返回原结果（不再入账）。"""
+    conn = connect("locklab-reversal-lookup")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {REVERSAL_COLUMNS} FROM reversals "
+                "WHERE run_id = %s AND transfer_key = %s",
+                (run_id, key),
+            )
+            row = cur.fetchone()
+        return _reversal_row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def admit_reversal(run: Run, key: str):
+    """在受理锁内做准入，并占住一个 in-flight 名额直到事务结束。
+
+    * 只有“最近受理的一轮”可以接受新冲销；
+    * 该轮必须已结束（非 running）；
+    * 只允许冲销本轮已确认提交的调拨单；
+    * 名额与新一轮的库存重置共用 _manager_cond，保证重置一定排在其后。
+    """
+    global _reversals_inflight
+    with _manager_cond:
+        if _latest_accepted_run_id != run.run_id:
+            raise ReversalError("只允许冲销最近受理的一轮；该轮之后已有新一轮被受理")
+        with run.lock:
+            status = run.status
+            worker = dict(run.workers.get(key) or {})
+        if status == "running" or run.finished_at is None:
+            raise ReversalError("该轮尚未结束，暂不能冲销")
+        if not worker:
+            raise ReversalError(f"调拨单 {key} 不属于该轮")
+        if worker.get("result") != "committed":
+            raise ReversalError(
+                f"调拨单 {key} 在本轮未确认提交（{worker.get('result') or '未完成'}），不能冲销"
+            )
+        _reversals_inflight += 1
+
+
+def release_reversal_admission():
+    global _reversals_inflight
+    with _manager_cond:
+        _reversals_inflight -= 1
+        _manager_cond.notify_all()
+
+
+def perform_reversal(run: Run, key: str) -> tuple[dict, bool]:
+    """按原调拨数量反向调回；库存与冲销记录同一事务提交。
+
+    返回 (冲销记录, 是否为重复提交回放)。
+    """
+    t = TRANSFERS[key]
+    conn = connect(f"locklab-reversal-{key}")
+    try:
+        with conn.cursor() as cur:
+            # 先抢冲销记录的插入权：唯一键保证同一轮同一单只有一个事务能拿到行。
+            # 并发重复请求会阻塞在这里，等第一个事务结束后返回 0 行。
+            cur.execute(
+                "INSERT INTO reversals "
+                "(run_id, transfer_key, transfer_id, from_location, to_location, qty) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (run_id, transfer_key) DO NOTHING "
+                "RETURNING reversal_id",
+                (run.run_id, key, t["id"], t["from"], t["to"], t["qty"]),
+            )
+            inserted = cur.fetchone()
+
+            if inserted is None:
+                # 已有一笔冲销落账：不重复扣加库存，原样返回当时的冲销结果
+                cur.execute(
+                    f"SELECT {REVERSAL_COLUMNS} FROM reversals "
+                    "WHERE run_id = %s AND transfer_key = %s",
+                    (run.run_id, key),
+                )
+                existing = cur.fetchone()
+                conn.rollback()
+                if existing is None:  # 理论上不可达：冲突行一定可见
+                    raise ReversalError("冲销记录冲突但读取不到原结果，请重试")
+                return _reversal_row_to_dict(existing), True
+
+            # 同一事务内反向调回：源库位加回、目标库位扣回。
+            # 按库位排序加行锁，避免不同调拨单并发冲销时形成等待环。
+            balances = {}
+            for loc in sorted((t["from"], t["to"])):
+                delta = t["qty"] if loc == t["from"] else -t["qty"]
+                cur.execute(
+                    "UPDATE inventory SET qty_on_hand = qty_on_hand + %s, "
+                    "updated_at = now() WHERE location_id = %s "
+                    "RETURNING qty_on_hand",
+                    (delta, loc),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ReversalError(f"库位 {loc} 不存在，冲销回滚")
+                balances[loc] = row[0]
+
+            from_after = balances[t["from"]]
+            to_after = balances[t["to"]]
+            cur.execute(
+                "UPDATE reversals SET from_qty_after = %s, to_qty_after = %s "
+                "WHERE reversal_id = %s",
+                (from_after, to_after, inserted[0]),
+            )
+
+            # 库存与冲销记录在同一个事务里提交；任一写入失败都会一起回滚
+            conn.commit()
+
+            cur.execute(
+                f"SELECT {REVERSAL_COLUMNS} FROM reversals WHERE reversal_id = %s",
+                (inserted[0],),
+            )
+            record = _reversal_row_to_dict(cur.fetchone())
+        return record, False
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:  # pragma: no cover
+            pass
+        raise
+    finally:
+        # 连接关闭 = 事务一定已结束，之后才释放 in-flight 名额，
+        # 这样新一轮的库存重置不会与冲销交错。
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # HTTP 接口
 # --------------------------------------------------------------------------- #
 @app.route("/")
@@ -440,7 +660,7 @@ def index():
 
 @app.route("/api/runs", methods=["POST"])
 def start_run():
-    global _active_run
+    global _active_run, _latest_accepted_run_id
     payload = request.get_json(silent=True) or {}
     lock_order = payload.get("lock_order", "opposite")
     if lock_order not in ("same", "opposite"):
@@ -469,6 +689,8 @@ def start_run():
         )
         _active_run = run
         _runs[run.run_id] = run
+        # 新一轮一受理，旧轮立刻失去“新冲销”的资格
+        _latest_accepted_run_id = run.run_id
 
     threading.Thread(target=run_supervisor, args=(run,), name="supervisor", daemon=True).start()
     return jsonify({"run_id": run.run_id}), 201
@@ -480,6 +702,76 @@ def get_run(run_id):
     if run is None:
         return jsonify({"error": "轮次不存在"}), 404
     return jsonify(run.public())
+
+
+@app.route("/api/runs/<run_id>/reversals", methods=["POST"])
+def reverse_transfer(run_id):
+    """冲销本轮某一笔已确认提交的调拨单（按原数量反向调回）。"""
+    run = _runs.get(run_id)
+    if run is None:
+        return jsonify({"error": "轮次不存在"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    key = payload.get("transfer_key")
+    if key not in TRANSFERS:
+        return jsonify({"error": "transfer_key 只能是 T1 或 T2"}), 400
+
+    try:
+        ensure_reversals_schema()
+        existing = fetch_existing_reversal(run.run_id, key)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("reversal pre-check failed")
+        return jsonify({"error": f"冲销前检查失败: {exc}"}), 500
+
+    if existing is not None:
+        # 幂等重提：无论之后是否已有新一轮，都不再入账，返回原冲销结果
+        with run.lock:
+            run.reversals[key] = existing
+        body = {"ok": True, "duplicate": True, "reversal": existing,
+                "transfers": TRANSFERS, "inventory": run.inventory_after}
+        return jsonify(body), 200
+
+    if _latest_accepted_run_id != run.run_id:
+        return jsonify({"error": "只允许冲销最近受理的一轮；该轮之后已有新一轮被受理"}), 409
+
+    try:
+        admit_reversal(run, key)
+    except ReversalError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:  # noqa: BLE001
+        log.exception("reversal admission failed")
+        return jsonify({"error": f"冲销受理失败: {exc}"}), 500
+
+    try:
+        record, duplicate = perform_reversal(run, key)
+        with run.lock:
+            run.reversals[key] = record
+        # 冲销提交后刷新页面展示的库存实况（原调拨结局 workers 保持不动）。
+        # 这只是展示用快照，失败也不应把已提交的冲销报成失败。
+        inventory = run.inventory_after
+        try:
+            inv_conn = connect("locklab-reversal-view")
+            try:
+                inventory = fetch_inventory(inv_conn)
+            finally:
+                inv_conn.close()
+            run.inventory_after = inventory
+        except Exception:  # noqa: BLE001
+            log.warning("refresh inventory after reversal failed", exc_info=True)
+        log.info("reversal %s run=%s key=%s duplicate=%s",
+                 record["reversal_id"], run_id, key, duplicate)
+    except ReversalError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:  # noqa: BLE001
+        log.exception("reversal failed")
+        return jsonify({"error": f"冲销失败，事务已回滚: {exc}"}), 500
+    finally:
+        release_reversal_admission()
+
+    body = {"ok": True, "duplicate": duplicate, "reversal": record,
+            "transfers": TRANSFERS, "inventory": inventory}
+    # 首次入账 201；并发重复提交（被数据库唯一键挡住）返回 200 + 原冲销结果
+    return jsonify(body), 200 if duplicate else 201
 
 
 @app.route("/api/runs/<run_id>/cancel", methods=["POST"])
